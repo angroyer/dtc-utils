@@ -110,3 +110,32 @@ Run the script:
 ```bash
 C:\Users\XXXXX\AppData\Local\Programs\Python\Python313-32\python.exe read_ecu_dtc.py
 ```
+
+For reported UDS DTCs, including airbag codes, `read_ecu_dtc.py` requests
+available snapshot records (service `19 03` and `19 04`) and extended data
+(`19 06`) using the full three-byte DTC identifier. If record identification
+is unavailable, it requests all snapshot records and falls back to records
+`01`–`04`. Responses and failures are displayed for each request. The record
+data is shown as raw hex because its layout and meaning can be manufacturer
+specific; availability depends on the ECU and diagnostic session. These reads
+do not clear DTCs. Airbag diagnosis and repairs should be handled by a
+qualified technician.
+
+To read standard emission-related codes and freeze-frame data:
+```bash
+C:\Users\XXXXX\AppData\Local\Programs\Python\Python313-32\python.exe read_obd_dtc.py
+```
+
+For each ECU with stored, pending, or permanent codes, the script probes OBD-II
+freeze-frame numbers 0 through 15 and displays selected measurements for each
+frame with an associated DTC. It compares each associated DTC with the reported
+code lists and notes codes with no matching frame in the checked range. Other
+frame numbers and manufacturer-specific snapshots are not checked. An ECU may
+not provide a separate freeze frame for every DTC; a negative response or timeout
+does not prove a frame is empty. The scan may take time when frames do not respond.
+PIDs and freeze frames depend on vehicle support and may be unavailable.
+Measurement requests that receive negative responses are summarized rather than
+displayed individually.
+MAP is absolute pressure; these measurements do not identify a failed part.
+Read them safely while parked, not while operating the computer and driving.
+This report does not clear codes or freeze-frame data.

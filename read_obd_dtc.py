@@ -5,6 +5,8 @@ Services used:
   Mode 03 (0x03) - Request stored emission-related DTCs
   Mode 07 (0x07) - Request pending emission-related DTCs
   Mode 0A (0x0A) - Request permanent emission-related DTCs
+  Mode 01 (0x01) - Discover ECUs using supported-PID requests
+  Mode 02 (0x02) - Read freeze-frame data
   Mode 04 (0x04) - Clear DTCs (optional, prompts before executing)
 
 The functional request address 0x7DF is broadcast to all ECUs;
@@ -23,7 +25,7 @@ from PyJ2534.PyJ2534 import (
     ProtocolID, FilterType, TxFlags,
     PASSTHRU_MSG,
 )
-from PyJ2534.PyJ2534.error import J2534Error
+from PyJ2534.PyJ2534.error import J2534Error, J2534Errors
 
 
 # ── OBD-II CAN addressing (ISO 15765-4, 11-bit IDs) ──────────────────────────
@@ -61,6 +63,21 @@ ECU_SLOT_NAMES = {
 
 # DTC system identifier characters (ISO 15031-6, first nibble bits 7-6).
 DTC_SYSTEM = {0b00: 'P', 0b01: 'C', 0b10: 'B', 0b11: 'U'}
+
+FREEZE_FRAME_COUNT = 16
+
+# PID, label, required data bytes, decoder, unit.
+DIAGNOSTIC_PIDS = (
+    (0x04, "Calculated engine load", 1, lambda d: d[0] * 100 / 255, "%"),
+    (0x05, "Coolant temperature", 1, lambda d: d[0] - 40, "C"),
+    (0x0B, "Intake manifold absolute pressure (MAP)", 1, lambda d: d[0], "kPa absolute"),
+    (0x0C, "Engine speed", 2, lambda d: (256 * d[0] + d[1]) / 4, "rpm"),
+    (0x0D, "Vehicle speed", 1, lambda d: d[0], "km/h"),
+    (0x0F, "Intake air temperature", 1, lambda d: d[0] - 40, "C"),
+    (0x10, "Mass air flow", 2, lambda d: (256 * d[0] + d[1]) / 100, "g/s"),
+    (0x11, "Absolute throttle position", 1, lambda d: d[0] * 100 / 255, "%"),
+    (0x33, "Barometric pressure", 1, lambda d: d[0], "kPa absolute"),
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -110,7 +127,8 @@ def setup_flow_filter(iface, channel, txid, rxid):
     )
 
 
-def transact(iface, channel, txid, rxid, payload, timeout_ms=1000):
+def transact(iface, channel, txid, rxid, payload, timeout_ms=1000,
+             expected_prefix=None):
     """Send a single OBD-II / UDS request and return the first valid
     application-layer response payload (sans 4-byte CAN prefix), or None.
     Handles UDS 0x7F xx 0x78 (responsePending) by extending the deadline.
@@ -124,7 +142,9 @@ def transact(iface, channel, txid, rxid, payload, timeout_ms=1000):
         try:
             msgs = iface.PassThruReadMsgs(channel_id=channel,
                                           num_msgs=1, timeout=200)
-        except J2534Error:
+        except J2534Error as e:
+            if e.error not in (J2534Errors.ERR_TIMEOUT, J2534Errors.ERR_BUFFER_EMPTY):
+                raise
             msgs = []
 
         for m in msgs:
@@ -140,10 +160,16 @@ def transact(iface, channel, txid, rxid, payload, timeout_ms=1000):
                 continue
 
             # responsePending – ECU is still processing.
-            if len(data) >= 3 and data[0] == 0x7F and data[2] == 0x78:
+            if (len(data) >= 3 and data[0] == 0x7F
+                    and data[1] == payload[0] and data[2] == 0x78):
                 deadline = time.time() + 5.0
                 continue
 
+            if expected_prefix is not None:
+                is_negative = (len(data) >= 2 and data[0] == 0x7F
+                               and data[1] == payload[0])
+                if not is_negative and not data.startswith(expected_prefix):
+                    continue
             return data
     return None
 
@@ -167,11 +193,8 @@ def parse_dtc_response(resp, positive_sid):
     """
     if resp is None or len(resp) == 0:
         return None  # no response
-    if resp[0] == 0x7F:
-        return []    # negative response → service not supported / no DTCs
-
     if resp[0] != positive_sid:
-        return []    # unexpected SID
+        return None  # negative or unexpected response
 
     body = resp[1:]  # skip positive SID byte
     dtcs = []
@@ -288,13 +311,13 @@ def read_stored_dtcs(iface, channel, txid, rxid):
     print(f"  Mode 03 raw: {hexs(resp) if resp else 'no response'}")
     dtcs = parse_dtc_response(resp, positive_sid=0x43)
     if dtcs is None:
-        print("  Mode 03: no response")
+        print("  Mode 03: DTC read failed or was unsupported")
     elif not dtcs:
         print("  Mode 03: no stored DTCs")
     else:
         for code in dtcs:
             print(f"  [STORED]  {code}")
-    return dtcs or []
+    return dtcs
 
 
 def read_pending_dtcs(iface, channel, txid, rxid):
@@ -303,13 +326,13 @@ def read_pending_dtcs(iface, channel, txid, rxid):
     print(f"  Mode 07 raw: {hexs(resp) if resp else 'no response'}")
     dtcs = parse_dtc_response(resp, positive_sid=0x47)
     if dtcs is None:
-        print("  Mode 07: no response")
+        print("  Mode 07: DTC read failed or was unsupported")
     elif not dtcs:
         print("  Mode 07: no pending DTCs")
     else:
         for code in dtcs:
             print(f"  [PENDING]  {code}")
-    return dtcs or []
+    return dtcs
 
 
 def read_permanent_dtcs(iface, channel, txid, rxid):
@@ -318,13 +341,81 @@ def read_permanent_dtcs(iface, channel, txid, rxid):
     print(f"  Mode 0A raw: {hexs(resp) if resp else 'no response'}")
     dtcs = parse_dtc_response(resp, positive_sid=0x4A)
     if dtcs is None:
-        print("  Mode 0A: no response")
+        print("  Mode 0A: DTC read failed or was unsupported")
     elif not dtcs:
         print("  Mode 0A: no permanent DTCs")
     else:
         for code in dtcs:
             print(f"  [PERMANENT]  {code}")
-    return dtcs or []
+    return dtcs
+
+
+def read_obd_pid(iface, channel, txid, rxid, mode, pid, data_length, frame_number=0):
+    """Read one live or freeze-frame PID; return (data, error description)."""
+    request = bytes([mode, pid])
+    prefix = bytes([mode + 0x40, pid])
+    if mode == 0x02:
+        request += bytes([frame_number])
+        prefix += bytes([frame_number])
+    resp = transact(iface, channel, txid, rxid, request, timeout_ms=800,
+                    expected_prefix=prefix)
+    if resp is None:
+        return None, "no response (unsupported or unavailable)"
+    if resp[0] == 0x7F:
+        return None, f"negative response: {hexs(resp)}"
+    if len(resp) < len(prefix) + data_length:
+        return None, f"truncated response: {hexs(resp)}"
+    return resp[len(prefix):len(prefix) + data_length], None
+
+
+def print_diagnostic_measurements(iface, channel, txid, rxid, mode, frame_number=0):
+    negative_responses = []
+    for pid, label, size, decode, unit in DIAGNOSTIC_PIDS:
+        data, error = read_obd_pid(iface, channel, txid, rxid, mode, pid, size,
+                                   frame_number=frame_number)
+        if error and error.startswith("negative response: "):
+            negative_responses.append(error.removeprefix("negative response: "))
+        elif error:
+            print(f"    {label} (PID {pid:02X}): {error}")
+        else:
+            print(f"    {label} (PID {pid:02X}): {decode(data):.2f} {unit}")
+    if negative_responses:
+        responses = ', '.join(dict.fromkeys(negative_responses))
+        print(f"    {len(negative_responses)} measurement(s) omitted due to "
+              f"negative responses: {responses}")
+
+
+def report_freeze_frames(iface, channel, txid, rxid, dtc_statuses):
+    """Probe frame numbers and compare their associated DTCs with reported codes."""
+    print(f"\n  Freeze frames 0-{FREEZE_FRAME_COUNT - 1}:")
+    matched = set()
+    associated = no_dtc = unavailable = 0
+    for frame_number in range(FREEZE_FRAME_COUNT):
+        data, error = read_obd_pid(iface, channel, txid, rxid, 0x02, 0x02, 2,
+                                   frame_number=frame_number)
+        if error:
+            print(f"    Frame {frame_number}: {error}")
+            unavailable += 1
+        elif data == b'\x00\x00':
+            print(f"    Frame {frame_number}: no associated DTC reported")
+            no_dtc += 1
+        else:
+            frame_dtc = decode_dtc_pair(data[0], data[1])
+            statuses = dtc_statuses.get(frame_dtc)
+            status_text = ' | '.join(statuses) if statuses else 'not reported in DTC reads'
+            print(f"    Frame {frame_number}: {frame_dtc} [{status_text}]")
+            print("    Measurements (when this frame was recorded):")
+            print_diagnostic_measurements(iface, channel, txid, rxid, 0x02,
+                                          frame_number=frame_number)
+            associated += 1
+            matched.add(frame_dtc)
+
+    print(f"  Frame probe results: {associated} with an associated DTC, "
+          f"{no_dtc} with no DTC, {unavailable} unavailable or unconfirmed.")
+    unmatched = [code for code in dtc_statuses if code not in matched]
+    if unmatched:
+        print(f"  No matching frame reported in this range for: {', '.join(unmatched)}")
+    print("  Other frame numbers and manufacturer-specific snapshots were not checked.")
 
 
 def clear_dtcs(iface, channel, txid, rxid):
@@ -389,6 +480,7 @@ def main():
     all_stored   = {}
     all_pending  = {}
     all_permanent = {}
+    incomplete = False
 
     try:
         ecus = discover_ecus(iface, channel)
@@ -406,6 +498,7 @@ def main():
                 fid = setup_flow_filter(iface, channel, txid, rxid)
             except J2534Error as e:
                 print(f"  Could not set flow-control filter: {e}")
+                incomplete = True
                 continue
 
             try:
@@ -419,12 +512,26 @@ def main():
                 pending   = read_pending_dtcs(iface, channel, txid, rxid)
                 permanent = read_permanent_dtcs(iface, channel, txid, rxid)
 
+                if stored is None or pending is None or permanent is None:
+                    incomplete = True
+                stored = stored or []
+                pending = pending or []
+                permanent = permanent or []
+
                 if stored:
                     all_stored[rxid]    = stored
                 if pending:
                     all_pending[rxid]   = pending
                 if permanent:
                     all_permanent[rxid] = permanent
+
+                dtc_statuses = {}
+                for status, codes in (("STORED", stored), ("PENDING", pending),
+                                      ("PERMANENT", permanent)):
+                    for code in codes:
+                        dtc_statuses.setdefault(code, []).append(status)
+                if dtc_statuses:
+                    report_freeze_frames(iface, channel, txid, rxid, dtc_statuses)
 
             finally:
                 try:
@@ -441,7 +548,7 @@ def main():
     print("SUMMARY")
     print(f"{'='*50}")
     if not any([all_stored, all_pending, all_permanent]):
-        print("No DTCs found on any ECU.")
+        print("No DTCs found in successful responses.")
     else:
         for rxid, codes in all_stored.items():
             name = ECU_SLOT_NAMES.get(rxid, f"0x{rxid:03X}")
@@ -453,6 +560,8 @@ def main():
             name = ECU_SLOT_NAMES.get(rxid, f"0x{rxid:03X}")
             print(f"  {name} – permanent: {', '.join(codes)}")
 
+    if incomplete:
+        print("Some DTC reads failed or were unsupported; results may be incomplete.")
     print("\nDone.")
 
 

@@ -14,7 +14,7 @@ from PyJ2534.PyJ2534 import (
     ProtocolID, FilterType, TxFlags,
     PASSTHRU_MSG,
 )
-from PyJ2534.PyJ2534.error import J2534Error
+from PyJ2534.PyJ2534.error import J2534Error, J2534Errors
 
 # 11-bit CAN ID pairs (request_id, response_id) for all known ECUs.
 # Each entry: (request_id, response_id, description)
@@ -98,7 +98,8 @@ def setup_flow_filter(iface, channel, txid, rxid):
     )
 
 
-def request(iface, channel, txid, rxid, payload, timeout_ms=1000):
+def request(iface, channel, txid, rxid, payload, timeout_ms=1000,
+            expected_prefix=None):
     """Send a UDS request and return the first non-echo, non-pending
     response payload (without the 2-byte CAN id), or None on timeout.
     """
@@ -111,7 +112,9 @@ def request(iface, channel, txid, rxid, payload, timeout_ms=1000):
             responses = iface.PassThruReadMsgs(
                 channel_id=channel, num_msgs=1, timeout=200,
             )
-        except J2534Error:
+        except J2534Error as e:
+            if e.error not in (J2534Errors.ERR_TIMEOUT, J2534Errors.ERR_BUFFER_EMPTY):
+                raise
             responses = []
 
         for r in responses:
@@ -128,10 +131,16 @@ def request(iface, channel, txid, rxid, payload, timeout_ms=1000):
                 continue
 
             # Handle UDS negative response 7F xx 78 (responsePending).
-            if len(data) >= 3 and data[0] == 0x7F and data[2] == 0x78:
+            if (len(data) >= 3 and data[0] == 0x7F
+                    and data[1] == payload[0] and data[2] == 0x78):
                 deadline = time.time() + 5.0
                 continue
 
+            if expected_prefix is not None:
+                is_negative = (len(data) >= 2 and data[0] == 0x7F
+                               and data[1] == payload[0])
+                if not is_negative and not data.startswith(expected_prefix):
+                    continue
             return data
     return None
 
@@ -182,7 +191,7 @@ DTC_KIND = {0: 'P', 1: 'C', 2: 'B', 3: 'U'}
 def decode_dtc(dtc_bytes):
     """Decode a 3-byte ISO 15031-6 / ISO 14229 DTC into "Bxxxx" form.
     Returns (code, failure_type): code is the 5-char DTC string, failure_type
-    is the third byte (OBD failure type / snapshot identifier).
+    is the third byte (UDS DTC failure type byte).
     """
     b1, b2, b3 = dtc_bytes
     kind = DTC_KIND[(b1 >> 6) & 0x03]
@@ -225,7 +234,7 @@ def read_dtcs_uds(iface, channel, txid, rxid):
     for i in range(0, len(records) - 3, 4):
         code, ftype = decode_dtc(records[i:i + 3])
         status = records[i + 3]
-        dtcs.append((code, status))
+        dtcs.append((code, status, bytes(records[i:i + 3])))
         print(f"  DTC {code}  failureType=0x{ftype:02X}  status=0x{status:02X}")
     if not dtcs:
         print("  no DTC stored")
@@ -262,106 +271,77 @@ def _try_ascii(data):
     return ''
 
 
-def read_dtc_snapshot(iface, channel, txid, rxid, dtc_b1, dtc_b2, dtc_b3=0xFF):
-    """UDS 0x19 0x04 / 0x19 0x06 – read freeze-frame and extended data
-    for a single DTC identified by its raw 3-byte UDS DTC identifier.
-    """
-    code, _ = decode_dtc(bytes([dtc_b1, dtc_b2, dtc_b3]))
-    # ── Freeze-frame (snapshot) ──────────────────────────────────────────────
-    print(f"\n  Freeze-frame (0x19 0x04) for DTC {code}:")
-    # Try record numbers 0x01-0x04 first; 0xFF (all records) is often rejected.
-    ff_resp = None
-    for rec_num in (0x01, 0x02, 0x03, 0x04, 0xFF):
-        r = request(iface, channel, txid, rxid,
-                    bytes([0x19, 0x04, dtc_b1, dtc_b2, dtc_b3, rec_num]),
-                    timeout_ms=2000)
-        if r is not None and r[0] != 0x7F:
-            ff_resp = r
-            print(f"    (record 0x{rec_num:02X} responded)")
-            break
-        if r is not None and r[0] == 0x7F:
-            nrc = r[2] if len(r) >= 3 else 0
-            if nrc not in (0x12, 0x31):  # show unexpected NRCs only
-                print(f"    record 0x{rec_num:02X} negative: {hexs(r)}")
-    resp = ff_resp
+def read_snapshot_identifiers(iface, channel, txid, rxid):
+    """Discover (full DTC, snapshot record number) pairs when supported."""
+    resp = request(iface, channel, txid, rxid, b'\x19\x03', timeout_ms=2000,
+                   expected_prefix=b'\x59\x03')
     if resp is None:
-        print("    no freeze-frame data (ECU may not support this sub-function)")
-    elif resp[0] == 0x7F:
-        print(f"    negative: {hexs(resp)}")
-    elif resp[0] == 0x59 and len(resp) >= 6 and resp[1] == 0x04:
-        status = resp[5]
-        flags = ' | '.join(filter(None, [
-            'testFailed'     if status & 0x01 else '',
-            'failedThisCycle' if status & 0x02 else '',
-            'pending'        if status & 0x04 else '',
-            'confirmed'      if status & 0x08 else '',
-            'failedSinceClr' if status & 0x20 else '',
-            'lamp'           if status & 0x80 else '',
-        ]))
-        print(f"    DTC status at snapshot: 0x{status:02X} [{flags}]")
-        if len(resp) > 6:
-            snap = resp[6:]
-            print(f"    snapshot data: {hexs(snap)}")
-            # Try to parse: [recNum numDIDs [DID_H DID_L data...]*]*
-            idx = 0
-            while idx + 1 < len(snap):
-                rec_num  = snap[idx]
-                num_dids = snap[idx + 1]
-                idx += 2
-                print(f"      record 0x{rec_num:02X}: {num_dids} DID(s)")
-                for _ in range(num_dids):
-                    if idx + 2 > len(snap):
-                        break
-                    did = (snap[idx] << 8) | snap[idx + 1]
-                    idx += 2
-                    # Collect remaining bytes as DID data (heuristic: stop
-                    # when next 2 bytes look like a valid DID or end reached)
-                    end = idx
-                    while end + 2 <= len(snap):
-                        next_did = (snap[end] << 8) | snap[end + 1]
-                        if 0x0100 <= next_did <= 0xFFFF:
-                            break
-                        end += 1
-                    did_data = snap[idx:end]
-                    idx = end
-                    print(f"        DID 0x{did:04X}: {hexs(did_data)}{_try_ascii(did_data)}")
-                if num_dids == 0:
-                    break
-    else:
-        print(f"    raw: {hexs(resp) if resp else 'none'}")
+        print("  Snapshot identification: no response")
+        return {}
+    if resp[0] == 0x7F:
+        print(f"  Snapshot identification negative: {hexs(resp)}")
+        return {}
+    records = resp[2:]
+    if len(records) % 4:
+        print(f"  Snapshot identification malformed: {hexs(resp)}")
+        return {}
+    found = {}
+    for i in range(0, len(records), 4):
+        dtc = bytes(records[i:i + 3])
+        record = records[i + 3]
+        found.setdefault(dtc, [])
+        if record not in found[dtc]:
+            found[dtc].append(record)
+    print(f"  Snapshot identification: {len(records) // 4} record(s)")
+    return found
 
-    # ── Extended data (0x19 0x06) ────────────────────────────────────────────
-    print(f"  Extended data  (0x19 0x06) for DTC {code}:")
+
+def read_dtc_data_record(iface, channel, txid, rxid, dtc, subfunction, record):
+    """Read one UDS DTC data request and print the validated response as raw bytes."""
     resp = request(iface, channel, txid, rxid,
-                   bytes([0x19, 0x06, dtc_b1, dtc_b2, dtc_b3, 0xFF]),
-                   timeout_ms=3000)
+                   bytes([0x19, subfunction]) + dtc + bytes([record]),
+                   timeout_ms=2000, expected_prefix=bytes([0x59, subfunction]))
+    label = f"    request record 0x{record:02X}"
     if resp is None:
-        print("    no response")
-    elif resp[0] == 0x7F:
-        print(f"    negative: {hexs(resp)}")
-    elif resp[0] == 0x59 and len(resp) >= 7 and resp[1] == 0x06:
-        # resp: 59 06 b1 b2 b3 status [recNum data...]*
-        ext = resp[6:]   # skip SID/SF + 3-byte DTC + status
-        print(f"    raw ext: {hexs(ext)}")
-        # Parse HKMC ext-data structure: [recNum(1) data...] repeating
-        # For record 0xFF (all): expect recNum=FF then N data bytes
-        idx = 0
-        while idx < len(ext):
-            rec = ext[idx]; idx += 1
-            data = ext[idx:]
-            print(f"    record 0x{rec:02X} ({len(data)} bytes): {hexs(data)}")
-            # Decode known HKMC counters (little-endian 16-bit pairs)
-            if len(data) >= 2:
-                c1 = data[0] | (data[1] << 8)
-                print(f"      [0-1] ignition-cycles since first detection : {c1}")
-            if len(data) >= 4:
-                c2 = data[2] | (data[3] << 8)
-                print(f"      [2-3] ignition-cycles total (current)        : {c2}")
-            if len(data) >= 5:
-                print(f"      [4+]  remaining bytes: {hexs(data[4:])}")
-            break  # only one record expected when recNum=0xFF
-    else:
-        print(f"    raw: {hexs(resp) if resp else 'none'}")
+        print(f"{label}: no response")
+        return False
+    if resp[0] == 0x7F:
+        print(f"{label}: negative response {hexs(resp)}")
+        return False
+    if len(resp) < 6 or resp[2:5] != dtc:
+        print(f"{label}: malformed or mismatched response {hexs(resp)}")
+        return False
+    print(f"{label}: current DTC status 0x{resp[5]:02X}")
+    if len(resp) == 6:
+        print("      no record data in response")
+        return False
+    if subfunction == 0x04:
+        if len(resp) < 8:
+            print(f"      truncated snapshot record: {hexs(resp[6:])}")
+            return False
+        if record != 0xFF and resp[6] != record:
+            print(f"      mismatched snapshot record: {hexs(resp[6:])}")
+            return False
+    print(f"      raw record data: {hexs(resp[6:])}")
+    return True
+
+
+def read_dtc_snapshot(iface, channel, txid, rxid, dtc, snapshot_records):
+    """Read UDS snapshot and extended data for the exact 3-byte DTC."""
+    code, failure_type = decode_dtc(dtc)
+    print(f"\n  Additional data for {code} (full DTC {hexs(dtc)}, "
+          f"failure type 0x{failure_type:02X}):")
+    print("  Snapshot records (0x19 0x04):")
+    if snapshot_records:
+        for record in snapshot_records:
+            read_dtc_data_record(iface, channel, txid, rxid, dtc, 0x04, record)
+    elif not read_dtc_data_record(iface, channel, txid, rxid, dtc, 0x04, 0xFF):
+        print("    All-record request unavailable; trying records 0x01-0x04.")
+        for record in (0x01, 0x02, 0x03, 0x04):
+            read_dtc_data_record(iface, channel, txid, rxid, dtc, 0x04, record)
+    print("  Extended data (0x19 0x06):")
+    read_dtc_data_record(iface, channel, txid, rxid, dtc, 0x06, 0xFF)
+    print("  Raw record contents require the ECU manufacturer's definitions.")
 
 
 def probe_uds_dids(iface, channel, txid, rxid):
@@ -412,7 +392,7 @@ def probe_uds_dids(iface, channel, txid, rxid):
         print("  No UDS DIDs responded.")
 
 
-def read_dtcs_uds_history(iface, channel, txid, rxid):
+def read_dtcs_uds_history(iface, channel, txid, rxid, initial_dtcs):
     """Supplement read_dtcs_uds() with additional UDS queries aimed at
     surfacing historical / confirmed DTCs that may be missed by mask 0xFF.
 
@@ -440,8 +420,12 @@ def read_dtcs_uds_history(iface, channel, txid, rxid):
         (0x09, "testFailed | confirmed"),
         (0xA8, "confirmed | failedSinceClear | lampRequested"),
     ]
-    # Maps DTC string code → (raw_b1, raw_b2, raw_b3, status)
+    # Keep the entire 3-byte identifier: different failure types can share a code.
     all_dtcs = {}
+    data_dtcs = {}
+    for code, status, raw_dtc in initial_dtcs:
+        all_dtcs[raw_dtc] = (code, status)
+        data_dtcs[raw_dtc] = None
     for mask, label in MASKS:
         resp = request(iface, channel, txid, rxid,
                        bytes([0x19, 0x02, mask]), timeout_ms=2000)
@@ -466,7 +450,9 @@ def read_dtcs_uds_history(iface, channel, txid, rxid):
                     'LAMP'       if status & 0x80 else '',
                 ]))
                 print(f"    DTC {code}  failureType=0x{b3:02X}  status=0x{status:02X}  [{status_bits}]")
-                all_dtcs[code] = (b1, b2, b3, status)
+                raw_dtc = bytes([b1, b2, b3])
+                all_dtcs[raw_dtc] = (code, status)
+                data_dtcs[raw_dtc] = None
 
     # ── 2. Sub-function 0x0A: ReportSupportedDTCs ────────────────────────────
     resp = request(iface, channel, txid, rxid, b'\x19\x0A', timeout_ms=2000)
@@ -478,7 +464,10 @@ def read_dtcs_uds_history(iface, channel, txid, rxid):
             code, _ = decode_dtc(bytes([b1, b2, b3]))
             status = records[i + 3]
             print(f"    DTC {code}  status=0x{status:02X}")
-            all_dtcs.setdefault(code, (b1, b2, b3, status))
+            raw_dtc = bytes([b1, b2, b3])
+            all_dtcs.setdefault(raw_dtc, (code, status))
+            if status & 0xAF:
+                data_dtcs[raw_dtc] = None
     elif resp:
         print(f"  0x19 0x0A: {hexs(resp)}")
 
@@ -503,17 +492,21 @@ def read_dtcs_uds_history(iface, channel, txid, rxid):
         code, _ = decode_dtc(bytes([b1, b2, b3]))
         status = resp[6] if len(resp) > 6 else 0
         print(f"  0x19 0x{sf:02X} ({label}): {code}  status=0x{status:02X}")
-        all_dtcs.setdefault(code, (b1, b2, b3, status))
+        raw_dtc = bytes([b1, b2, b3])
+        all_dtcs.setdefault(raw_dtc, (code, status))
+        data_dtcs[raw_dtc] = None
 
-    # ── 4. Freeze-frame for every unique DTC found ────────────────────────────
-    if all_dtcs:
+    # ── 4. Additional data for reported DTCs ──────────────────────────────────
+    if data_dtcs:
         request(iface, channel, txid, rxid, b'\x10\x03', timeout_ms=500)
-        for code, (b1, b2, b3, _) in all_dtcs.items():
-            read_dtc_snapshot(iface, channel, txid, rxid, b1, b2, b3)
+        records = read_snapshot_identifiers(iface, channel, txid, rxid)
+        for raw_dtc in data_dtcs:
+            read_dtc_snapshot(iface, channel, txid, rxid, raw_dtc,
+                              records.get(raw_dtc, []))
 
     if not all_dtcs:
         print("  No historical DTCs found via extended queries.")
-    return [(code, status) for code, (_, _, _, status) in all_dtcs.items()]
+    return list(all_dtcs.values())
 
 
 def read_dtcs_kwp_history(iface, channel, txid, rxid):
@@ -863,10 +856,10 @@ def main():
                 try:
                     request(iface, channel, txid, rxid, b'\x10\x01', timeout_ms=500)
                     dtcs = read_dtcs_uds(iface, channel, txid, rxid)
-                    for code, status in dtcs:
+                    for code, status, _ in dtcs:
                         summary[ecu_key][code] = status
                     # Always run all probes – each re-enters its own session.
-                    hist = read_dtcs_uds_history(iface, channel, txid, rxid)
+                    hist = read_dtcs_uds_history(iface, channel, txid, rxid, dtcs)
                     for code, status in hist:
                         summary[ecu_key].setdefault(code, status)
                     probe_uds_dids(iface, channel, txid, rxid)
