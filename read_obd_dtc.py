@@ -225,7 +225,7 @@ def discover_ecus(iface, channel):
     mask = PASSTHRU_MSG(
         ProtocolID.ISO15765,
         tx_flags=TxFlags.ISO15765_FRAME_PAD,
-        data=b'\xFF\xF8\xFF\xFF',          # mask out low 3 bits of ID
+        data=b'\xFF\xFF\xFF\xF8',          # mask out low 3 bits of ID
     )
     pattern = PASSTHRU_MSG(
         ProtocolID.ISO15765,
@@ -238,40 +238,36 @@ def discover_ecus(iface, channel):
             filter_type=FilterType.PASS_FILTER,
             mask_msg=mask, pattern_msg=pattern,
         )
-    except J2534Error:
-        # Fallback: use individual flow-control filters per slot.
+    except J2534Error as e:
+        print(f"  Functional discovery filter unavailable: {e}")
         fid = None
 
-    # Send functional request.
-    iface.PassThruWriteMsgs(
-        channel_id=channel,
-        msgs=[build_msg(OBD_FUNCTIONAL_TX, b'\x01\x00')],
-        timeout=200,
-    )
-
     responding_rxids = set()
-    deadline = time.time() + 1.5
-    while time.time() < deadline:
-        try:
-            msgs = iface.PassThruReadMsgs(channel_id=channel,
-                                          num_msgs=10, timeout=200)
-        except J2534Error:
-            msgs = []
-        for m in msgs:
-            raw = get_msg_bytes(m)
-            if len(raw) < 5:
-                continue
-            if int(m._RxStatus) & 0x09:
-                continue
-            rid = struct.unpack('>I', raw[:4])[0]
-            if 0x7E8 <= rid <= 0x7EF:
-                responding_rxids.add(rid)
-
     if fid is not None:
         try:
+            iface.PassThruWriteMsgs(
+                channel_id=channel,
+                msgs=[build_msg(OBD_FUNCTIONAL_TX, b'\x01\x00')],
+                timeout=200,
+            )
+            deadline = time.time() + 1.5
+            while time.time() < deadline:
+                try:
+                    msgs = iface.PassThruReadMsgs(channel_id=channel,
+                                                  num_msgs=1, timeout=200)
+                except J2534Error as e:
+                    if e.error not in (J2534Errors.ERR_TIMEOUT, J2534Errors.ERR_BUFFER_EMPTY):
+                        raise
+                    msgs = []
+                for m in msgs:
+                    raw = get_msg_bytes(m)
+                    if len(raw) < 10 or int(m._RxStatus) & 0x09:
+                        continue
+                    rid = struct.unpack('>I', raw[:4])[0]
+                    if 0x7E8 <= rid <= 0x7EF and raw[4:6] == b'\x41\x00':
+                        responding_rxids.add(rid)
+        finally:
             iface.PassThruStopMsgFilter(channel_id=channel, filter_id=fid)
-        except J2534Error:
-            pass
 
     found = []
     for rxid in sorted(responding_rxids):
@@ -281,27 +277,34 @@ def discover_ecus(iface, channel):
         found.append((txid, rxid))
 
     if not found:
-        print("  No ECU responded to functional broadcast.")
-        # Fall back to trying all standard slots individually.
+        if fid is not None:
+            print("  No ECU responded to functional broadcast.")
         print("  Falling back to individual slot probing...")
         for txid, rxid in OBD_ECU_SLOTS:
+            if txid == OBD_FUNCTIONAL_TX:
+                continue
             try:
                 fid2 = setup_flow_filter(iface, channel, txid, rxid)
             except J2534Error as e:
                 print(f"    filter error TX=0x{txid:03X}: {e}")
                 continue
             try:
-                resp = transact(iface, channel, txid, rxid,
-                                b'\x01\x00', timeout_ms=400)
+                for request_id in (txid, OBD_FUNCTIONAL_TX):
+                    resp = transact(iface, channel, request_id, rxid,
+                                    b'\x01\x00', timeout_ms=1000,
+                                    expected_prefix=b'\x41\x00')
+                    if resp is not None and len(resp) >= 6 and resp.startswith(b'\x41\x00'):
+                        name = ECU_SLOT_NAMES.get(rxid, f"RX=0x{rxid:03X}")
+                        print(f"  Found ECU: TX=0x{txid:03X}  RX=0x{rxid:03X}  [{name}]")
+                        found.append((txid, rxid))
+                        break
+                    if resp is not None:
+                        print(f"    Probe TX=0x{request_id:03X} RX=0x{rxid:03X}: "
+                              f"negative or incomplete response {hexs(resp)}")
+                else:
+                    print(f"    No valid Mode 01 PID 00 response from RX=0x{rxid:03X}.")
             finally:
-                try:
-                    iface.PassThruStopMsgFilter(channel_id=channel, filter_id=fid2)
-                except J2534Error:
-                    pass
-            if resp is not None:
-                name = ECU_SLOT_NAMES.get(rxid, f"RX=0x{rxid:03X}")
-                print(f"  Found ECU: TX=0x{txid:03X}  RX=0x{rxid:03X}  [{name}]")
-                found.append((txid, rxid))
+                iface.PassThruStopMsgFilter(channel_id=channel, filter_id=fid2)
     return found
 
 
